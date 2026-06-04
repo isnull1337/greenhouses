@@ -6,7 +6,8 @@
 #define GREENHOUSE_INVALID_ID         (-1)
 
 #define GREENHOUSE_GROW_TIME          (600)
-#define GREENHOUSE_UPDATE_INTERVAL    (5)
+
+#define GREENHOUSE_UPDATE_INTERVAL    (10)
 
 #define GREENHOUSE_STAGE_EMPTY        (0)
 #define GREENHOUSE_STAGE_SMALL        (1)
@@ -24,6 +25,12 @@
 #define GREENHOUSE_OBJECT_MEDIUM      (805)
 #define GREENHOUSE_OBJECT_READY       (1369)
 
+#define GREENHOUSE_VISUAL_SMALL_COUNT  (1)
+#define GREENHOUSE_VISUAL_MEDIUM_COUNT (2)
+#define GREENHOUSE_VISUAL_READY_COUNT  (3)
+
+#define GREENHOUSE_VISUAL_MAX          (3)
+
 #define COLOR_RED                     (0xFF0000FF)
 #define COLOR_GREEN                   (0x33CC33FF)
 #define COLOR_WHITE                   (0xFFFFFFFF)
@@ -33,8 +40,13 @@
 
 forward Greenhouse_UpdateTimer();
 forward Greenhouse_OnLoad();
-forward Greenhouse_OnPlayerLoad(playerid);
-forward Greenhouse_OnCreated(playerid, greenhouseid);
+forward Greenhouse_OnCreated(playerid);
+
+static Float:g_visual_offsets[GREENHOUSE_VISUAL_MAX][3] = {
+    {  1.0,  0.0, 0.5 },
+    { -0.7,  0.7, 0.5 },
+    {  0.0, -1.0, 0.5 }
+};
 
 enum E_GREENHOUSE_DATA
 {
@@ -55,7 +67,7 @@ enum E_GREENHOUSE_DATA
     bool:E_EXISTS,
 
     STREAMER_TAG_OBJECT:E_OBJECT,
-    STREAMER_TAG_OBJECT:E_STAGE_OBJECT,
+    STREAMER_TAG_OBJECT:E_VISUAL_OBJECTS[GREENHOUSE_VISUAL_MAX],
     STREAMER_TAG_3D_TEXT_LABEL:E_LABEL
 };
 
@@ -69,6 +81,12 @@ stock Greenhouse:Init()
     for(new i; i < GREENHOUSE_MAX; i++)
     {
         g_greenhouse_data[i][E_DATABASE_ID] = GREENHOUSE_INVALID_ID;
+        g_greenhouse_data[i][E_EXISTS]       = false;
+
+        for(new v; v < GREENHOUSE_VISUAL_MAX; v++)
+        {
+            g_greenhouse_data[i][E_VISUAL_OBJECTS][v] = STREAMER_TAG_OBJECT:-1;
+        }
     }
 
     for(new playerid; playerid < MAX_PLAYERS; playerid++)
@@ -77,6 +95,7 @@ stock Greenhouse:Init()
         {
             g_player_greenhouse[playerid][slot] = INVALID_GREENHOUSE_SLOT;
         }
+        g_player_greenhouse_count[playerid] = 0;
     }
 
     Greenhouse:Load();
@@ -102,6 +121,7 @@ public Greenhouse_OnLoad()
 
         if(greenhouseid == INVALID_GREENHOUSE_SLOT)
         {
+            print("[GREENHOUSE] ERROR: превышен GREENHOUSE_MAX!");
             break;
         }
 
@@ -111,19 +131,16 @@ public Greenhouse_OnLoad()
         g_greenhouse_data[greenhouseid][E_POS_Y] = cache_get_field_float(row, "pos_y");
         g_greenhouse_data[greenhouseid][E_POS_Z] = cache_get_field_float(row, "pos_z");
 
-        g_greenhouse_data[greenhouseid][E_OWNER_ID] = cache_get_field_int(row, "owner_id");
-
-        g_greenhouse_data[greenhouseid][E_STAGE] = cache_get_field_int(row, "stage");
+        g_greenhouse_data[greenhouseid][E_OWNER_ID]   = cache_get_field_int(row, "owner_id");
+        g_greenhouse_data[greenhouseid][E_STAGE]      = cache_get_field_int(row, "stage");
         g_greenhouse_data[greenhouseid][E_CREATED_AT] = cache_get_field_int(row, "created_at");
-        g_greenhouse_data[greenhouseid][E_UPGRADE] = cache_get_field_int(row, "upgrade_type");
-
-        g_greenhouse_data[greenhouseid][E_EXISTS] = true;
+        g_greenhouse_data[greenhouseid][E_UPGRADE]    = cache_get_field_int(row, "upgrade_type");
+        g_greenhouse_data[greenhouseid][E_EXISTS]     = true;
 
         Greenhouse:CreateEntity(greenhouseid);
     }
 
     printf("[GREENHOUSE] Loaded: %d", rows);
-
     return 1;
 }
 
@@ -132,12 +149,39 @@ stock Greenhouse:GetFreeSlot()
     for(new i; i < GREENHOUSE_MAX; i++)
     {
         if(g_greenhouse_data[i][E_DATABASE_ID] == GREENHOUSE_INVALID_ID)
-        {
             return i;
-        }
     }
-
     return INVALID_GREENHOUSE_SLOT;
+}
+
+stock Greenhouse:GetGrowTime(greenhouseid)
+{
+    if(g_greenhouse_data[greenhouseid][E_UPGRADE] == GREENHOUSE_UPGRADE_SPEED)
+        return GREENHOUSE_GROW_TIME / 2;
+
+    return GREENHOUSE_GROW_TIME;
+}
+
+stock Greenhouse:GetProgress(greenhouseid)
+{
+    new passed = gettime() - g_greenhouse_data[greenhouseid][E_CREATED_AT];
+
+    if(passed < 0)  passed = 0;
+
+    new grow_time = Greenhouse:GetGrowTime(greenhouseid);
+    new progress  = floatround(float(passed) / float(grow_time) * 100.0, floatround_floor);
+
+    if(progress > 100)  progress = 100;
+
+    return progress;
+}
+
+stock Greenhouse:GetStageByProgress(progress)
+{
+    if(progress >= 100) return GREENHOUSE_STAGE_READY;
+    if(progress >= 66)  return GREENHOUSE_STAGE_MEDIUM;
+    if(progress >= 33)  return GREENHOUSE_STAGE_SMALL;
+    return GREENHOUSE_STAGE_EMPTY;
 }
 
 stock Greenhouse:CreateEntity(greenhouseid)
@@ -148,9 +192,7 @@ stock Greenhouse:CreateEntity(greenhouseid)
             g_greenhouse_data[greenhouseid][E_POS_X],
             g_greenhouse_data[greenhouseid][E_POS_Y],
             g_greenhouse_data[greenhouseid][E_POS_Z],
-            0.0,
-            0.0,
-            0.0
+            0.0, 0.0, 0.0
         );
 
     Greenhouse:UpdateVisual(greenhouseid);
@@ -164,87 +206,22 @@ stock Greenhouse:DestroyEntity(greenhouseid)
     if(IsValidDynamicObject(g_greenhouse_data[greenhouseid][E_OBJECT]))
     {
         DestroyDynamicObject(g_greenhouse_data[greenhouseid][E_OBJECT]);
+        g_greenhouse_data[greenhouseid][E_OBJECT] = STREAMER_TAG_OBJECT:-1;
     }
 
-    if(IsValidDynamicObject(g_greenhouse_data[greenhouseid][E_STAGE_OBJECT]))
+    for(new v; v < GREENHOUSE_VISUAL_MAX; v++)
     {
-        DestroyDynamicObject(g_greenhouse_data[greenhouseid][E_STAGE_OBJECT]);
+        if(IsValidDynamicObject(g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v]))
+        {
+            DestroyDynamicObject(g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v]);
+            g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v] = STREAMER_TAG_OBJECT:-1;
+        }
     }
 
     if(IsValidDynamic3DTextLabel(g_greenhouse_data[greenhouseid][E_LABEL]))
     {
         DestroyDynamic3DTextLabel(g_greenhouse_data[greenhouseid][E_LABEL]);
-    }
-
-    return 1;
-}
-
-stock Greenhouse:GetGrowTime(greenhouseid)
-{
-    new grow_time = GREENHOUSE_GROW_TIME;
-
-    if(g_greenhouse_data[greenhouseid][E_UPGRADE] == GREENHOUSE_UPGRADE_SPEED)
-    {
-        grow_time /= 2;
-    }
-
-    return grow_time;
-}
-
-stock Greenhouse:GetStageByProgress(progress)
-{
-    if(progress >= 100)
-    {
-        return GREENHOUSE_STAGE_READY;
-    }
-
-    if(progress >= 66)
-    {
-        return GREENHOUSE_STAGE_MEDIUM;
-    }
-
-    if(progress >= 33)
-    {
-        return GREENHOUSE_STAGE_SMALL;
-    }
-
-    return GREENHOUSE_STAGE_EMPTY;
-}
-
-stock Greenhouse:GetProgress(greenhouseid)
-{
-    new passed = gettime() - g_greenhouse_data[greenhouseid][E_CREATED_AT];
-
-    if(passed < 0)
-    {
-        passed = 0;
-    }
-
-    new grow_time = Greenhouse:GetGrowTime(greenhouseid);
-
-    new progress = floatround((float(passed) / float(grow_time)) * 100.0);
-
-    if(progress > 100)
-    {
-        progress = 100;
-    }
-
-    return progress;
-}
-
-stock Greenhouse:Process(greenhouseid)
-{
-    new progress = Greenhouse:GetProgress(greenhouseid);
-    new stage = Greenhouse:GetStageByProgress(progress);
-
-    if(stage != g_greenhouse_data[greenhouseid][E_STAGE])
-    {
-        g_greenhouse_data[greenhouseid][E_STAGE] = stage;
-
-        Greenhouse:UpdateVisual(greenhouseid);
-        Greenhouse:UpdateLabel(greenhouseid);
-
-        Greenhouse:Save(greenhouseid);
+        g_greenhouse_data[greenhouseid][E_LABEL] = STREAMER_TAG_3D_TEXT_LABEL:-1;
     }
 
     return 1;
@@ -252,35 +229,55 @@ stock Greenhouse:Process(greenhouseid)
 
 stock Greenhouse:UpdateVisual(greenhouseid)
 {
-    if(IsValidDynamicObject(g_greenhouse_data[greenhouseid][E_STAGE_OBJECT]))
+    new stage = g_greenhouse_data[greenhouseid][E_STAGE];
+
+    new modelid;
+    new count;
+
+    switch(stage)
     {
-        DestroyDynamicObject(g_greenhouse_data[greenhouseid][E_STAGE_OBJECT]);
+        case GREENHOUSE_STAGE_SMALL:
+        {
+            modelid = GREENHOUSE_OBJECT_SMALL;
+            count   = GREENHOUSE_VISUAL_SMALL_COUNT;
+        }
+        case GREENHOUSE_STAGE_MEDIUM:
+        {
+            modelid = GREENHOUSE_OBJECT_MEDIUM;
+            count   = GREENHOUSE_VISUAL_MEDIUM_COUNT;
+        }
+        case GREENHOUSE_STAGE_READY:
+        {
+            modelid = GREENHOUSE_OBJECT_READY;
+            count   = GREENHOUSE_VISUAL_READY_COUNT;
+        }
+        default:
+        {
+            modelid = -1;
+            count   = 0;
+        }
     }
 
-    new modelid = -1;
-
-    switch(g_greenhouse_data[greenhouseid][E_STAGE])
+    for(new v; v < GREENHOUSE_VISUAL_MAX; v++)
     {
-        case GREENHOUSE_STAGE_SMALL: modelid = GREENHOUSE_OBJECT_SMALL;
-        case GREENHOUSE_STAGE_MEDIUM: modelid = GREENHOUSE_OBJECT_MEDIUM;
-        case GREENHOUSE_STAGE_READY: modelid = GREENHOUSE_OBJECT_READY;
-    }
+        if(IsValidDynamicObject(g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v]))
+        {
+            DestroyDynamicObject(g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v]);
+            g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v] = STREAMER_TAG_OBJECT:-1;
+        }
 
-    if(modelid == -1)
-    {
-        return 1;
+        if(v < count)
+        {
+            g_greenhouse_data[greenhouseid][E_VISUAL_OBJECTS][v] =
+                CreateDynamicObject(
+                    modelid,
+                    g_greenhouse_data[greenhouseid][E_POS_X] + g_visual_offsets[v][0],
+                    g_greenhouse_data[greenhouseid][E_POS_Y] + g_visual_offsets[v][1],
+                    g_greenhouse_data[greenhouseid][E_POS_Z] + g_visual_offsets[v][2],
+                    0.0, 0.0, 0.0
+                );
+        }
     }
-
-    g_greenhouse_data[greenhouseid][E_STAGE_OBJECT] =
-        CreateDynamicObject(
-            modelid,
-            g_greenhouse_data[greenhouseid][E_POS_X],
-            g_greenhouse_data[greenhouseid][E_POS_Y],
-            g_greenhouse_data[greenhouseid][E_POS_Z] + 1.0,
-            0.0,
-            0.0,
-            0.0
-        );
 
     return 1;
 }
@@ -292,14 +289,17 @@ stock Greenhouse:UpdateLabel(greenhouseid)
         DestroyDynamic3DTextLabel(g_greenhouse_data[greenhouseid][E_LABEL]);
     }
 
-    new string[144];
+    new string[160];
+
+    new stage_names[][] = { "Пусто", "Рассада", "Растёт", "Готово!" };
+    new stage = g_greenhouse_data[greenhouseid][E_STAGE];
 
     format(
         string,
         sizeof(string),
-        "{FFFFFF}Теплица\n{00FF00}Рост: %d%%\n{FFFF00}Стадия: %d",
+        "{FFFFFF}Теплица\n{00FF00}Рост: %d%%\n{FFFF00}Стадия: %s",
         Greenhouse:GetProgress(greenhouseid),
-        g_greenhouse_data[greenhouseid][E_STAGE]
+        stage_names[stage]
     );
 
     g_greenhouse_data[greenhouseid][E_LABEL] =
@@ -308,7 +308,7 @@ stock Greenhouse:UpdateLabel(greenhouseid)
             COLOR_WHITE,
             g_greenhouse_data[greenhouseid][E_POS_X],
             g_greenhouse_data[greenhouseid][E_POS_Y],
-            g_greenhouse_data[greenhouseid][E_POS_Z] + 2.0,
+            g_greenhouse_data[greenhouseid][E_POS_Z] + 2.5,
             15.0
         );
 
@@ -335,11 +335,65 @@ stock Greenhouse:Save(greenhouseid)
     return 1;
 }
 
+stock Greenhouse:Process(greenhouseid)
+{
+    new progress = Greenhouse:GetProgress(greenhouseid);
+    new stage    = Greenhouse:GetStageByProgress(progress);
+
+    if(stage != g_greenhouse_data[greenhouseid][E_STAGE])
+    {
+        g_greenhouse_data[greenhouseid][E_STAGE] = stage;
+
+        Greenhouse:UpdateVisual(greenhouseid);
+        Greenhouse:UpdateLabel(greenhouseid);
+
+        Greenhouse:Save(greenhouseid);
+    }
+
+    return 1;
+}
+
+public Greenhouse_UpdateTimer()
+{
+    new online_ids[MAX_PLAYERS];
+    new online_count = 0;
+
+    foreach(new playerid : Player)
+    {
+        online_ids[online_count++] = GetPlayerSQLID(playerid);
+    }
+
+    for(new i; i < GREENHOUSE_MAX; i++)
+    {
+        if(!g_greenhouse_data[i][E_EXISTS])
+            continue;
+
+        new owner = g_greenhouse_data[i][E_OWNER_ID];
+        new is_online = false;
+
+        for(new j; j < online_count; j++)
+        {
+            if(online_ids[j] == owner)
+            {
+                is_online = true;
+                break;
+            }
+        }
+
+        if(is_online)
+        {
+            Greenhouse:Process(i);
+        }
+    }
+
+    return 1;
+}
+
 stock Greenhouse:Create(playerid, Float:x, Float:y, Float:z)
 {
     if(g_player_greenhouse_count[playerid] >= GREENHOUSE_MAX_PLAYER)
     {
-        SendClientMessage(playerid, COLOR_RED, "Лимит теплиц.");
+        SendClientMessage(playerid, COLOR_RED, "Лимит теплиц (максимум 5).");
         return 1;
     }
 
@@ -351,9 +405,7 @@ stock Greenhouse:Create(playerid, Float:x, Float:y, Float:z)
         sizeof(query),
         "INSERT INTO greenhouses (owner_id, pos_x, pos_y, pos_z, stage, created_at, upgrade_type) VALUES('%d', '%f', '%f', '%f', '0', '%d', '0')",
         GetPlayerSQLID(playerid),
-        x,
-        y,
-        z,
+        x, y, z,
         gettime()
     );
 
@@ -362,20 +414,22 @@ stock Greenhouse:Create(playerid, Float:x, Float:y, Float:z)
     return 1;
 }
 
-public Greenhouse_OnCreated(playerid, greenhouseid)
+public Greenhouse_OnCreated(playerid)
 {
     new slot = Greenhouse:GetFreeSlot();
 
     if(slot == INVALID_GREENHOUSE_SLOT)
     {
+        print("[GREENHOUSE] ERROR: нет свободных слотов!");
         return 1;
     }
 
     g_greenhouse_data[slot][E_DATABASE_ID] = cache_insert_id();
-    g_greenhouse_data[slot][E_OWNER_ID] = GetPlayerSQLID(playerid);
-    g_greenhouse_data[slot][E_CREATED_AT] = gettime();
-    g_greenhouse_data[slot][E_STAGE] = GREENHOUSE_STAGE_EMPTY;
-    g_greenhouse_data[slot][E_EXISTS] = true;
+    g_greenhouse_data[slot][E_OWNER_ID]    = GetPlayerSQLID(playerid);
+    g_greenhouse_data[slot][E_CREATED_AT]  = gettime();
+    g_greenhouse_data[slot][E_STAGE]       = GREENHOUSE_STAGE_EMPTY;
+    g_greenhouse_data[slot][E_UPGRADE]     = GREENHOUSE_UPGRADE_NONE;
+    g_greenhouse_data[slot][E_EXISTS]      = true;
 
     GetPlayerPos(playerid,
         g_greenhouse_data[slot][E_POS_X],
@@ -384,10 +438,9 @@ public Greenhouse_OnCreated(playerid, greenhouseid)
     );
 
     Greenhouse:CreateEntity(slot);
-
     Greenhouse:AddPlayerGreenhouse(playerid, slot);
 
-    SendClientMessage(playerid, COLOR_GREEN, "Теплица создана.");
+    SendClientMessage(playerid, COLOR_GREEN, "Теплица успешно создана.");
 
     return 1;
 }
@@ -409,7 +462,7 @@ stock Greenhouse:Delete(greenhouseid)
     Greenhouse:DestroyEntity(greenhouseid);
 
     g_greenhouse_data[greenhouseid][E_DATABASE_ID] = GREENHOUSE_INVALID_ID;
-    g_greenhouse_data[greenhouseid][E_EXISTS] = false;
+    g_greenhouse_data[greenhouseid][E_EXISTS]       = false;
 
     return 1;
 }
@@ -425,7 +478,20 @@ stock Greenhouse:AddPlayerGreenhouse(playerid, greenhouseid)
             return 1;
         }
     }
+    return 0;
+}
 
+stock Greenhouse:RemovePlayerGreenhouse(playerid, greenhouseid)
+{
+    for(new slot; slot < GREENHOUSE_MAX_PLAYER; slot++)
+    {
+        if(g_player_greenhouse[playerid][slot] == greenhouseid)
+        {
+            g_player_greenhouse[playerid][slot] = INVALID_GREENHOUSE_SLOT;
+            g_player_greenhouse_count[playerid]--;
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -436,14 +502,10 @@ stock Greenhouse:LoadPlayer(playerid)
     for(new i; i < GREENHOUSE_MAX; i++)
     {
         if(!g_greenhouse_data[i][E_EXISTS])
-        {
             continue;
-        }
 
         if(g_greenhouse_data[i][E_OWNER_ID] != ownerid)
-        {
             continue;
-        }
 
         Greenhouse:AddPlayerGreenhouse(playerid, i);
     }
@@ -457,7 +519,6 @@ stock Greenhouse:UnloadPlayer(playerid)
     {
         g_player_greenhouse[playerid][slot] = INVALID_GREENHOUSE_SLOT;
     }
-
     g_player_greenhouse_count[playerid] = 0;
 
     return 1;
@@ -468,9 +529,7 @@ stock Greenhouse:GetNearest(playerid)
     for(new i; i < GREENHOUSE_MAX; i++)
     {
         if(!g_greenhouse_data[i][E_EXISTS])
-        {
             continue;
-        }
 
         if(IsPlayerInRangeOfPoint(
             playerid,
@@ -483,7 +542,6 @@ stock Greenhouse:GetNearest(playerid)
             return i;
         }
     }
-
     return INVALID_GREENHOUSE_SLOT;
 }
 
@@ -491,11 +549,11 @@ stock Greenhouse:Harvest(playerid, greenhouseid)
 {
     if(g_greenhouse_data[greenhouseid][E_STAGE] != GREENHOUSE_STAGE_READY)
     {
-        SendClientMessage(playerid, COLOR_RED, "Урожай еще не созрел.");
+        SendClientMessage(playerid, COLOR_RED, "Урожай ещё не созрел.");
         return 1;
     }
 
-    g_greenhouse_data[greenhouseid][E_STAGE] = GREENHOUSE_STAGE_EMPTY;
+    g_greenhouse_data[greenhouseid][E_STAGE]      = GREENHOUSE_STAGE_EMPTY;
     g_greenhouse_data[greenhouseid][E_CREATED_AT] = gettime();
 
     Greenhouse:UpdateVisual(greenhouseid);
@@ -505,27 +563,30 @@ stock Greenhouse:Harvest(playerid, greenhouseid)
 
     GivePlayerMoney(playerid, 1000);
 
-    SendClientMessage(playerid, COLOR_GREEN, "Вы собрали урожай.");
+    SendClientMessage(playerid, COLOR_GREEN, "Вы собрали урожай! +$1000");
 
     return 1;
 }
 
-public Greenhouse_UpdateTimer()
+stock Greenhouse:Upgrade(playerid, greenhouseid)
 {
-    foreach(new playerid : Player)
+    if(g_greenhouse_data[greenhouseid][E_OWNER_ID] != GetPlayerSQLID(playerid))
     {
-        for(new slot; slot < GREENHOUSE_MAX_PLAYER; slot++)
-        {
-            new greenhouseid = g_player_greenhouse[playerid][slot];
-
-            if(greenhouseid == INVALID_GREENHOUSE_SLOT)
-            {
-                continue;
-            }
-
-            Greenhouse:Process(greenhouseid);
-        }
+        SendClientMessage(playerid, COLOR_RED, "Это не ваша теплица.");
+        return 1;
     }
+
+    if(g_greenhouse_data[greenhouseid][E_UPGRADE] == GREENHOUSE_UPGRADE_SPEED)
+    {
+        SendClientMessage(playerid, COLOR_RED, "Теплица уже улучшена.");
+        return 1;
+    }
+
+    g_greenhouse_data[greenhouseid][E_UPGRADE] = GREENHOUSE_UPGRADE_SPEED;
+
+    Greenhouse:Save(greenhouseid);
+
+    SendClientMessage(playerid, COLOR_GREEN, "Теплица улучшена! Скорость роста x2.");
 
     return 1;
 }
@@ -541,17 +602,50 @@ CMD:harvest(playerid)
     }
 
     Greenhouse:Harvest(playerid, greenhouseid);
-
     return 1;
 }
 
 CMD:buygreenhouse(playerid)
 {
     new Float:x, Float:y, Float:z;
-
     GetPlayerPos(playerid, x, y, z);
-
     Greenhouse:Create(playerid, x, y, z);
+    return 1;
+}
 
+CMD:upgradegreenhouse(playerid)
+{
+    new greenhouseid = Greenhouse:GetNearest(playerid);
+
+    if(greenhouseid == INVALID_GREENHOUSE_SLOT)
+    {
+        SendClientMessage(playerid, COLOR_RED, "Рядом нет теплицы.");
+        return 1;
+    }
+
+    Greenhouse:Upgrade(playerid, greenhouseid);
+    return 1;
+}
+
+CMD:deletegreenhouse(playerid)
+{
+    new greenhouseid = Greenhouse:GetNearest(playerid);
+
+    if(greenhouseid == INVALID_GREENHOUSE_SLOT)
+    {
+        SendClientMessage(playerid, COLOR_RED, "Рядом нет теплицы.");
+        return 1;
+    }
+
+    if(g_greenhouse_data[greenhouseid][E_OWNER_ID] != GetPlayerSQLID(playerid))
+    {
+        SendClientMessage(playerid, COLOR_RED, "Это не ваша теплица.");
+        return 1;
+    }
+
+    Greenhouse:RemovePlayerGreenhouse(playerid, greenhouseid);
+    Greenhouse:Delete(greenhouseid);
+
+    SendClientMessage(playerid, COLOR_GREEN, "Теплица удалена.");
     return 1;
 }
